@@ -1,8 +1,10 @@
 import asyncio
 import json
 from decimal import Decimal
+from datetime import datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from database import SessionLocal
 from models import Inventory, Order, OrderItem, OrderStatus, Product
@@ -18,16 +20,30 @@ async def create_order_from_message(payload: dict) -> None:
         shipping_address=payload["shipping_address"],
         items=payload["items"],
     )
-
     async with SessionLocal() as db:
         try:
+            order_id = payload.get("order_id")
+            created_at_str = payload.get("created_at")
+            created_at = None
+            if created_at_str:
+                try:
+                    created_at = datetime.fromisoformat(created_at_str)
+                except Exception:
+                    created_at = None
+
             order = Order(
+                order_id=order_id,
                 customer_name=order_in.customer_name,
                 customer_email=order_in.customer_email,
                 shipping_address=order_in.shipping_address,
                 status=OrderStatus.pending,
                 total_amount=Decimal("0"),
             )
+
+            # if API provided created_at, persist it
+            if created_at is not None:
+                order.created_at = created_at
+
             db.add(order)
             await db.flush()
 
@@ -44,6 +60,7 @@ async def create_order_from_message(payload: dict) -> None:
                     .where(Inventory.product_id == item_in.product_id)
                     .with_for_update()
                 )
+
                 if not inv or inv.quantity < item_in.quantity:
                     available = inv.quantity if inv else 0
                     raise ValueError(
@@ -64,6 +81,10 @@ async def create_order_from_message(payload: dict) -> None:
 
             order.total_amount = total
             await db.commit()
+        except IntegrityError:
+            # Duplicate order_id -> already processed, treat as success (ack)
+            await db.rollback()
+            return
         except Exception:
             await db.rollback()
             await restore_stock(payload["items"])

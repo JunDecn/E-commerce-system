@@ -46,6 +46,7 @@ class Order(Base):
     __tablename__ = "orders"
 
     id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(String(36), unique=True, index=True, nullable=False)
     customer_name = Column(String(100), nullable=False)
     customer_email = Column(String(200), nullable=False)
     shipping_address = Column(Text, nullable=False)

@@ -1,4 +1,5 @@
 from uuid import uuid4
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,9 +27,11 @@ async def create_order(payload: OrderCreate):
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
 
-    message_id = str(uuid4())
+    order_id = str(uuid4())
+    created_at = datetime.utcnow().isoformat()
     message_payload = {
-        "message_id": message_id,
+        "order_id": order_id,
+        "created_at": created_at,
         "customer_name": payload_dict["customer_name"],
         "customer_email": payload_dict["customer_email"],
         "shipping_address": payload_dict["shipping_address"],
@@ -36,13 +39,13 @@ async def create_order(payload: OrderCreate):
     }
 
     try:
-        await publish_order_message(message_payload, message_id=message_id)
+        await publish_order_message(message_payload, message_id=order_id)
     except Exception:
         await restore_stock(payload_dict["items"])
         raise HTTPException(status_code=503, detail="訂單佇列服務暫時不可用，請稍後再試")
 
     return OrderQueuedOut(
-        message_id=message_id,
+        order_id=order_id,
         status="queued",
         detail="庫存預扣成功，訂單已送入處理佇列",
     )

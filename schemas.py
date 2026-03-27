@@ -80,6 +80,7 @@ class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    order_id: str
     customer_name: str
     customer_email: str
     shipping_address: str
@@ -95,6 +96,6 @@ class OrderStatusUpdate(BaseModel):
 
 
 class OrderQueuedOut(BaseModel):
-    message_id: str
+    order_id: str
     status: str
     detail: str

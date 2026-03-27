@@ -92,3 +92,9 @@ class OrderOut(BaseModel):
 
 class OrderStatusUpdate(BaseModel):
     status: OrderStatus
+
+
+class OrderQueuedOut(BaseModel):
+    message_id: str
+    status: str
+    detail: str

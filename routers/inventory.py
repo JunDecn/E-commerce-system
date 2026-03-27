@@ -1,53 +1,59 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Inventory, Product
 from schemas import InventoryOut, InventoryUpdate, InventoryAdjust
+from services.redis_service import set_stock
 
 router = APIRouter(prefix="/inventory", tags=["庫存"])
 
 
-def _get_inventory_or_404(product_id: int, db: Session) -> Inventory:
-    product = db.query(Product).filter(Product.id == product_id).first()
+async def _get_inventory_or_404(product_id: int, db: AsyncSession) -> Inventory:
+    product = await db.scalar(select(Product).where(Product.id == product_id))
     if not product:
         raise HTTPException(status_code=404, detail="商品不存在")
-    inv = db.query(Inventory).filter(Inventory.product_id == product_id).first()
+    inv = await db.scalar(select(Inventory).where(Inventory.product_id == product_id))
     if not inv:
         raise HTTPException(status_code=404, detail="庫存紀錄不存在")
     return inv
 
 
 @router.get("/", response_model=list[InventoryOut])
-def list_inventory(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
+async def list_inventory(skip: int = 0, limit: int = 20, db: AsyncSession = Depends(get_db)):
     """列出所有商品庫存"""
-    return db.query(Inventory).offset(skip).limit(limit).all()
+    stmt = select(Inventory).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
 @router.get("/{product_id}", response_model=InventoryOut)
-def get_inventory(product_id: int, db: Session = Depends(get_db)):
+async def get_inventory(product_id: int, db: AsyncSession = Depends(get_db)):
     """查詢特定商品庫存"""
-    return _get_inventory_or_404(product_id, db)
+    return await _get_inventory_or_404(product_id, db)
 
 
 @router.put("/{product_id}", response_model=InventoryOut)
-def set_inventory(product_id: int, payload: InventoryUpdate, db: Session = Depends(get_db)):
+async def set_inventory(product_id: int, payload: InventoryUpdate, db: AsyncSession = Depends(get_db)):
     """直接設定庫存數量"""
-    inv = _get_inventory_or_404(product_id, db)
+    inv = await _get_inventory_or_404(product_id, db)
     inv.quantity = payload.quantity
-    db.commit()
-    db.refresh(inv)
+    await db.commit()
+    await db.refresh(inv)
+    await set_stock(product_id, inv.quantity)
     return inv
 
 
 @router.patch("/{product_id}/adjust", response_model=InventoryOut)
-def adjust_inventory(product_id: int, payload: InventoryAdjust, db: Session = Depends(get_db)):
+async def adjust_inventory(product_id: int, payload: InventoryAdjust, db: AsyncSession = Depends(get_db)):
     """調整庫存數量（delta 正數入庫，負數出庫）"""
-    inv = _get_inventory_or_404(product_id, db)
+    inv = await _get_inventory_or_404(product_id, db)
     new_qty = inv.quantity + payload.delta
     if new_qty < 0:
         raise HTTPException(status_code=400, detail=f"庫存不足，目前庫存 {inv.quantity}")
     inv.quantity = new_qty
-    db.commit()
-    db.refresh(inv)
+    await db.commit()
+    await db.refresh(inv)
+    await set_stock(product_id, inv.quantity)
     return inv

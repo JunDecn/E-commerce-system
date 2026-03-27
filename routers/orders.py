@@ -1,92 +1,77 @@
-from decimal import Decimal
+from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from database import get_db
-from models import Order, OrderItem, Product, Inventory, OrderStatus
-from schemas import OrderCreate, OrderOut, OrderStatusUpdate
+from models import Order, Inventory, OrderStatus
+from schemas import OrderCreate, OrderOut, OrderQueuedOut, OrderStatusUpdate
+from services.rabbitmq_service import publish_order_message
+from services.redis_service import reserve_stock_with_lua, restore_stock
 
 router = APIRouter(prefix="/orders", tags=["訂單"])
 
 
-@router.post("/", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
-def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
+@router.post("/", response_model=OrderQueuedOut, status_code=status.HTTP_202_ACCEPTED)
+async def create_order(payload: OrderCreate):
     """
-    建立訂單：
-    - 驗證商品存在
-    - 確認庫存充足
-    - 扣除庫存
-    - 計算總金額
+    建立訂單（非同步）：
+    - 以 Redis Lua script 原子檢查並預扣庫存
+    - 庫存足夠則送出 RabbitMQ 訊息
+    - 由 worker 非同步建立訂單並扣減 DB 庫存
     """
-    order = Order(
-        customer_name=payload.customer_name,
-        customer_email=payload.customer_email,
-        shipping_address=payload.shipping_address,
-        status=OrderStatus.pending,
-        total_amount=Decimal("0"),
+    payload_dict = payload.model_dump()
+    ok, detail = await reserve_stock_with_lua(payload_dict["items"])
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+
+    message_id = str(uuid4())
+    message_payload = {
+        "message_id": message_id,
+        "customer_name": payload_dict["customer_name"],
+        "customer_email": payload_dict["customer_email"],
+        "shipping_address": payload_dict["shipping_address"],
+        "items": payload_dict["items"],
+    }
+
+    try:
+        await publish_order_message(message_payload, message_id=message_id)
+    except Exception:
+        await restore_stock(payload_dict["items"])
+        raise HTTPException(status_code=503, detail="訂單佇列服務暫時不可用，請稍後再試")
+
+    return OrderQueuedOut(
+        message_id=message_id,
+        status="queued",
+        detail="庫存預扣成功，訂單已送入處理佇列",
     )
-    db.add(order)
-    db.flush()
-
-    total = Decimal("0")
-    for item_in in payload.items:
-        product = db.query(Product).filter(Product.id == item_in.product_id).first()
-        if not product:
-            raise HTTPException(
-                status_code=404,
-                detail=f"商品 ID {item_in.product_id} 不存在",
-            )
-
-        inv = (
-            db.query(Inventory)
-            .filter(Inventory.product_id == item_in.product_id)
-            .with_for_update()
-            .first()
-        )
-        if not inv or inv.quantity < item_in.quantity:
-            available = inv.quantity if inv else 0
-            raise HTTPException(
-                status_code=400,
-                detail=f"商品「{product.name}」庫存不足，目前庫存 {available}",
-            )
-
-        inv.quantity -= item_in.quantity
-        unit_price = Decimal(str(product.price))
-        total += unit_price * item_in.quantity
-
-        order_item = OrderItem(
-            order_id=order.id,
-            product_id=item_in.product_id,
-            quantity=item_in.quantity,
-            unit_price=unit_price,
-        )
-        db.add(order_item)
-
-    order.total_amount = total
-    db.commit()
-    db.refresh(order)
-    return order
 
 
 @router.get("/", response_model=list[OrderOut])
-def list_orders(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
+async def list_orders(skip: int = 0, limit: int = 20, db: AsyncSession = Depends(get_db)):
     """列出所有訂單（支援分頁）"""
-    return db.query(Order).offset(skip).limit(limit).all()
+    stmt = select(Order).options(selectinload(Order.items)).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
 @router.get("/{order_id}", response_model=OrderOut)
-def get_order(order_id: int, db: Session = Depends(get_db)):
+async def get_order(order_id: int, db: AsyncSession = Depends(get_db)):
     """查詢單筆訂單詳情"""
-    order = db.query(Order).filter(Order.id == order_id).first()
+    stmt = select(Order).where(Order.id == order_id).options(selectinload(Order.items))
+    order = await db.scalar(stmt)
     if not order:
         raise HTTPException(status_code=404, detail="訂單不存在")
     return order
 
 
 @router.patch("/{order_id}/status", response_model=OrderOut)
-def update_order_status(order_id: int, payload: OrderStatusUpdate, db: Session = Depends(get_db)):
+async def update_order_status(order_id: int, payload: OrderStatusUpdate, db: AsyncSession = Depends(get_db)):
     """更新訂單狀態（pending → confirmed → shipped / cancelled）"""
-    order = db.query(Order).filter(Order.id == order_id).first()
+    order = await db.scalar(
+        select(Order).where(Order.id == order_id).options(selectinload(Order.items))
+    )
     if not order:
         raise HTTPException(status_code=404, detail="訂單不存在")
 
@@ -97,20 +82,23 @@ def update_order_status(order_id: int, payload: OrderStatusUpdate, db: Session =
     # 若從 pending/confirmed 取消，歸還庫存
     if payload.status == OrderStatus.cancelled and order.status != OrderStatus.cancelled:
         for item in order.items:
-            inv = db.query(Inventory).filter(Inventory.product_id == item.product_id).first()
+            inv = await db.scalar(select(Inventory).where(Inventory.product_id == item.product_id))
             if inv:
                 inv.quantity += item.quantity
 
     order.status = payload.status
-    db.commit()
-    db.refresh(order)
-    return order
+    order_id = order.id
+    await db.commit()
+    stmt = select(Order).where(Order.id == order_id).options(selectinload(Order.items))
+    return await db.scalar(stmt)
 
 
 @router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_order(order_id: int, db: Session = Depends(get_db)):
+async def delete_order(order_id: int, db: AsyncSession = Depends(get_db)):
     """刪除訂單（僅限 pending 狀態）"""
-    order = db.query(Order).filter(Order.id == order_id).first()
+    order = await db.scalar(
+        select(Order).where(Order.id == order_id).options(selectinload(Order.items))
+    )
     if not order:
         raise HTTPException(status_code=404, detail="訂單不存在")
     if order.status != OrderStatus.pending:
@@ -118,9 +106,9 @@ def delete_order(order_id: int, db: Session = Depends(get_db)):
 
     # 歸還庫存
     for item in order.items:
-        inv = db.query(Inventory).filter(Inventory.product_id == item.product_id).first()
+        inv = await db.scalar(select(Inventory).where(Inventory.product_id == item.product_id))
         if inv:
             inv.quantity += item.quantity
 
-    db.delete(order)
-    db.commit()
+    await db.delete(order)
+    await db.commit()

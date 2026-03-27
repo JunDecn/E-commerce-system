@@ -87,7 +87,7 @@ export default function (data) {
     console.error(`Create order failed: status=${orderRes.status}, body=${orderRes.body}`);
   }
 
-  sleep(0.05);
+  // sleep(0.05);
 }
 
 export function teardown(data) {

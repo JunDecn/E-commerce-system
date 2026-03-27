@@ -39,7 +39,7 @@ docker compose run --rm k6
 
 ## 效能紀錄
 
-- 測試結果：執行 10,000 筆訂單請求，總耗時 **62 秒**。
+- 測試結果：執行 10,000 筆訂單請求，總耗時 **48 秒**。
 
   - 測試腳本：`tests/k6/order_flow_test.js`
   - 環境：透過 Docker Compose 的 `k6` 服務對 `api` 服務進行測試。

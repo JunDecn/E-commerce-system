@@ -1,0 +1,8 @@
+# 加入版本控制時排除私密資訊
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.db
+.venv/
+venv/

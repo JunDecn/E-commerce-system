@@ -3,7 +3,7 @@ import json
 from decimal import Decimal
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from database import SessionLocal
@@ -11,6 +11,68 @@ from models import Inventory, Order, OrderItem, OrderStatus, Product
 from schemas import OrderCreate
 from services.rabbitmq_service import get_queue, init_rabbitmq
 from services.redis_service import init_redis, restore_stock
+
+
+async def deduct_inventory_with_optimistic_lock(
+    db, product_id: int, quantity: int, max_retries: int = 3
+) -> None:
+    """
+    用樂觀鎖扣減庫存，避免race condition
+    
+    Args:
+        db: 資料庫連線
+        product_id: 商品ID
+        quantity: 要扣減的數量
+        max_retries: 最大重試次數
+    
+    Raises:
+        ValueError: 庫存不足或商品不存在
+    """
+    product = await db.scalar(select(Product).where(Product.id == product_id))
+    if not product:
+        raise ValueError(f"商品 ID {product_id} 不存在")
+    
+    for attempt in range(max_retries):
+        # 讀取當前庫存和版本號
+        inv = await db.scalar(
+            select(Inventory).where(Inventory.product_id == product_id)
+        )
+        
+        if not inv or inv.quantity < quantity:
+            available = inv.quantity if inv else 0
+            raise ValueError(
+                f"商品「{product.name}」庫存不足，目前庫存 {available}"
+            )
+        
+        current_version = inv.version
+        current_quantity = inv.quantity
+        
+        # 使用樂觀鎖更新：只有版本號匹配才會成功
+        result = await db.execute(
+            update(Inventory)
+            .where(
+                (Inventory.product_id == product_id)
+                & (Inventory.version == current_version)
+            )
+            .values(
+                quantity=current_quantity - quantity,
+                version=current_version + 1
+            )
+        )
+        
+        if result.rowcount > 0:
+            # 更新成功
+            return
+        
+        # 版本號不匹配，等待後重試
+        if attempt < max_retries - 1:
+            # 指數退避：第一次等待100ms，第二次200ms
+            await asyncio.sleep(0.1 * (attempt + 1))
+    
+    # 重試多次仍然失敗
+    raise ValueError(
+        f"商品 ID {product_id} 庫存扣減失敗，請稍後重試（版本衝突）"
+    )
 
 
 async def create_order_from_message(payload: dict) -> None:
@@ -51,23 +113,13 @@ async def create_order_from_message(payload: dict) -> None:
             sorted_items = sorted(order_in.items, key=lambda item: item.product_id)
 
             for item_in in sorted_items:
-                product = await db.scalar(select(Product).where(Product.id == item_in.product_id))
-                if not product:
-                    raise ValueError(f"商品 ID {item_in.product_id} 不存在")
-
-                inv = await db.scalar(
-                    select(Inventory)
-                    .where(Inventory.product_id == item_in.product_id)
-                    .with_for_update()
+                # 使用樂觀鎖扣減庫存
+                await deduct_inventory_with_optimistic_lock(
+                    db, item_in.product_id, item_in.quantity
                 )
-
-                if not inv or inv.quantity < item_in.quantity:
-                    available = inv.quantity if inv else 0
-                    raise ValueError(
-                        f"商品「{product.name}」庫存不足，目前庫存 {available}"
-                    )
-
-                inv.quantity -= item_in.quantity
+                
+                # 取得商品資訊以計算總金額
+                product = await db.scalar(select(Product).where(Product.id == item_in.product_id))
                 unit_price = Decimal(str(product.price))
                 total += unit_price * item_in.quantity
 

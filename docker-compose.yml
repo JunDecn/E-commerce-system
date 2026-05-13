@@ -1,3 +1,21 @@
+x-worker-base: &worker-base
+  build: .
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    DATABASE_URL: ${DATABASE_URL}
+    REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+    ORDER_QUEUE_NAME: ${ORDER_QUEUE_NAME:-order.create}
+  command: ["python", "-m", "workers.order_consumer"]
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    rabbitmq:
+      condition: service_healthy
+
 services:
 
   db:
@@ -83,24 +101,25 @@ services:
       api:
         condition: service_healthy
 
-  worker:
-    build: .
-    container_name: order_worker
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
-      ORDER_QUEUE_NAME: ${ORDER_QUEUE_NAME:-order.create}
-    command: ["python", "-m", "workers.order_consumer"]
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+  worker_1:
+    <<: *worker-base
+    container_name: order_worker_1
+
+  worker_2:
+    <<: *worker-base
+    container_name: order_worker_2
+
+  worker_3:
+    <<: *worker-base
+    container_name: order_worker_3
+
+  worker_4:
+    <<: *worker-base
+    container_name: order_worker_4
+
+  worker_5:
+    <<: *worker-base
+    container_name: order_worker_5
 
 networks:
   default:

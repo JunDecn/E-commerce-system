@@ -45,7 +45,6 @@
 ### 架構圖
 
 ```mermaid
-flowchart LR
     graph LR
     C[Client] --> API[FastAPI API]
     

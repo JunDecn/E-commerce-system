@@ -46,12 +46,26 @@
 
 ```mermaid
 flowchart LR
+    graph LR
     C[Client] --> API[FastAPI API]
-    API -->|Reserve stock (Lua)| R[(Redis)]
-    API -->|Publish order message| MQ[(RabbitMQ)]
-    MQ -->|Consume| W[Order Worker]
-    W -->|Create order & deduct stock| DB[(PostgreSQL)]
-    W -->|Compensation on failure| R
+    
+    subgraph Cache_Layer
+        R[(Redis)]
+    end
+
+    subgraph Messaging
+        MQ[(RabbitMQ)]
+    end
+
+    subgraph Storage
+        DB[(PostgreSQL)]
+    end
+
+    API -->|1. Reserve Stock| R
+    API -->|2. Publish Message| MQ
+    MQ -->|3. Consume| W[Order Worker]
+    W -->|4. Persist Data| DB
+    W -.->|5. Rollback / Compensation| R
 ```
 
 ### 啟動方式
